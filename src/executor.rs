@@ -231,8 +231,15 @@ impl AsyncExecutor for Tokio {
 pub struct Builder<J, R> {
     lifo: bool,
     max_concurrency: Option<usize>,
+    queue_capacity: QueueCapacity,
     runtime: R,
     phantom: PhantomData<fn(J)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueCapacity {
+    Unbounded,
+    Bounded(usize),
 }
 
 impl<J, R: Default> Default for Builder<J, R> {
@@ -247,6 +254,7 @@ impl<J, R> Builder<J, R> {
         Self {
             lifo: false,
             max_concurrency: None,
+            queue_capacity: QueueCapacity::Unbounded,
             runtime,
             phantom: PhantomData,
         }
@@ -265,6 +273,21 @@ impl<J, R> Builder<J, R> {
         self.max_concurrency = num.into();
         self
     }
+
+    /// Specify an explicit bound for the number of queued jobs waiting to run.
+    ///
+    /// When a bound is set, callers to [`ExecutorHandle::push`] will block
+    /// once the queue reaches this size until workers make progress.
+    /// By default, the queue is bounded to the detected concurrency level.
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero.
+    #[must_use]
+    pub fn queue_capacity(mut self, capacity: usize) -> Self {
+        assert!(capacity > 0, "queue capacity must be greater than zero");
+        self.queue_capacity = QueueCapacity::Bounded(capacity);
+        self
+    }
 }
 
 // TODO: remove usages of impl Trait where it muddies the API
@@ -281,11 +304,17 @@ impl<J: Send + 'static, R: SpawnWorker<J, F> + 'static, F: Clone> ExecutorBuilde
         let Self {
             lifo,
             max_concurrency,
+            queue_capacity,
             runtime,
             phantom: _,
         } = self;
 
         let max_concurrency = max_concurrency.unwrap_or_else(num_cpus::get);
+
+        let queue_limit = match queue_capacity {
+            QueueCapacity::Unbounded => None,
+            QueueCapacity::Bounded(capacity) => Some(capacity),
+        };
 
         let work = (0..max_concurrency)
             .map(|i| {
@@ -313,6 +342,7 @@ impl<J: Send + 'static, R: SpawnWorker<J, F> + 'static, F: Clone> ExecutorBuilde
             live: R::new_mutex(max_concurrency),
             unpark_var: R::new_condvar(),
             join_var: R::new_condvar(),
+            queue: QueueLimit::new(queue_limit),
         });
 
         let handles = abort_on_panic({
@@ -350,6 +380,7 @@ struct Core<J, R: Runtime + ?Sized> {
     unpark_var: R::Condvar,
     join_var: R::Condvar,
     stop: AtomicBool,
+    queue: QueueLimit,
 }
 
 /// Thread-safe view into a thread pool, for access by running jobs.
@@ -385,11 +416,82 @@ impl<J, R: Runtime + ?Sized> Core<J, R> {
     fn abort(&self) {
         self.stop.store(true, Ordering::SeqCst);
         R::notify_all(&self.unpark_var);
+        self.queue.wake_all();
     }
 
     fn push(&self, job: J) {
-        self.inj.push(job);
-        R::notify_one(&self.unpark_var);
+        if self.queue.reserve(&self.stop) {
+            self.inj.push(job);
+            R::notify_one(&self.unpark_var);
+        }
+    }
+
+    fn job_started(&self) { self.queue.release(); }
+}
+
+#[derive(Debug)]
+struct QueueLimit {
+    depth: parking_lot::Mutex<usize>,
+    waiters: parking_lot::Condvar,
+    limit: Option<usize>,
+}
+
+impl QueueLimit {
+    fn new(limit: Option<usize>) -> Self {
+        if let Some(limit) = limit {
+            assert!(limit > 0, "queue capacity must be greater than zero");
+            Self {
+                depth: parking_lot::Mutex::new(0),
+                waiters: parking_lot::Condvar::new(),
+                limit: Some(limit),
+            }
+        } else {
+            Self {
+                depth: parking_lot::Mutex::new(0),
+                waiters: parking_lot::Condvar::new(),
+                limit: None,
+            }
+        }
+    }
+
+    #[inline]
+    fn capacity(&self) -> Option<usize> { self.limit }
+
+    fn reserve(&self, stop: &AtomicBool) -> bool {
+        let Some(limit) = self.limit else {
+            return true;
+        };
+
+        let mut depth = self.depth.lock();
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+
+            if *depth < limit {
+                *depth += 1;
+                return true;
+            }
+
+            self.waiters.wait(&mut depth);
+        }
+    }
+
+    fn release(&self) {
+        if self.limit.is_none() {
+            return;
+        }
+
+        let mut depth = self.depth.lock();
+        debug_assert!(*depth > 0);
+        *depth -= 1;
+        self.waiters.notify_one();
+    }
+
+    fn wake_all(&self) {
+        if self.limit.is_some() {
+            self.waiters.notify_all();
+        }
     }
 }
 
@@ -466,6 +568,10 @@ impl<J, R: Runtime + ?Sized> Executor<J, R> {
     /// Get the number of tasks created for this executor
     #[must_use]
     pub fn max_concurrency(&self) -> usize { self.1.len() }
+
+    /// Get the bound on queued jobs, or `None` if the queue is unbounded.
+    #[must_use]
+    pub fn queue_capacity(&self) -> Option<usize> { self.0.queue.capacity() }
 }
 
 impl<J> Executor<J, Blocking> {
@@ -554,30 +660,31 @@ pub struct WorkerThread<J, R: Runtime + ?Sized> {
 
 impl<J, R: Runtime + ?Sized> WorkerThread<J, R> {
     fn get_job(&self) -> Option<J> {
-        self.work.pop().or_else(|| {
-            let WorkerThread { work, .. } = self;
-            let Core {
-                ref stop,
-                ref inj,
-                ref steal,
-                ..
-            } = *self.core;
-
-            loop {
-                if stop.load(Ordering::Acquire) {
-                    break None;
-                }
-
-                match inj
-                    .steal_batch_and_pop(work)
-                    .or_else(|| steal.iter().map(Stealer::steal).collect())
-                {
-                    Steal::Empty => break None,
-                    Steal::Success(job) => break Some(job),
-                    Steal::Retry => (),
-                }
+        loop {
+            if let Some(job) = self.work.pop() {
+                self.core.job_started();
+                return Some(job);
             }
-        })
+
+            let core = &*self.core;
+
+            if core.stop.load(Ordering::Acquire) {
+                return None;
+            }
+
+            match core
+                .inj
+                .steal_batch_and_pop(&self.work)
+                .or_else(|| core.steal.iter().map(Stealer::steal).collect())
+            {
+                Steal::Empty => return None,
+                Steal::Success(job) => {
+                    core.job_started();
+                    return Some(job);
+                },
+                Steal::Retry => (),
+            }
+        }
     }
 }
 
